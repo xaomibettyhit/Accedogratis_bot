@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
-football.db
+futbol.db
 .env
+*.log
