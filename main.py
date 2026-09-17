@@ -1,9 +1,8 @@
 import os
 import sqlite3
-import json
 import logging
-import urllib.request
-from datetime import datetime, timedelta
+import random
+from datetime import datetime
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,44 +12,33 @@ from telegram.ext import (
     ContextTypes
 )
 
+from data import LIGAS, PARTIDOS, FRASES_DIARIAS
+
+# ---------- Configuración ----------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-DB_PATH = "football.db"
+DB_PATH = "futbol.db"
 
-# Free, no-key football data source
-OPENFOOTBALL_BASE = "https://raw.githubusercontent.com/openfootball/football.json/master"
-
-LEAGUES = {
-    "premier_league": {"name": "Premier League", "path": "2025-26/en.1.json"},
-    "la_liga": {"name": "La Liga", "path": "2025-26/es.1.json"},
-    "bundesliga": {"name": "Bundesliga", "path": "2025-26/de.1.json"},
-    "serie_a": {"name": "Serie A", "path": "2025-26/it.1.json"},
-    "ligue_1": {"name": "Ligue 1", "path": "2025-26/fr.1.json"},
-}
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-
+# ---------- Base de datos ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers (
+        CREATE TABLE IF NOT EXISTS suscriptores (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            league TEXT DEFAULT 'premier_league',
-            subscribed_at TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sent_matches (
-            match_key TEXT PRIMARY KEY,
-            sent_at TEXT
+            nombre TEXT,
+            liga TEXT DEFAULT 'la_liga',
+            registrado_en TEXT
         )
     """)
     conn.commit()
     conn.close()
-
 
 def db_exec(query, params=()):
     conn = sqlite3.connect(DB_PATH)
@@ -61,216 +49,245 @@ def db_exec(query, params=()):
     conn.close()
     return r
 
-
-def fetch_league(league_key):
-    """Fetch fixtures/results JSON from openfootball (no API key)."""
-    info = LEAGUES.get(league_key)
-    if not info:
-        return None
-    url = f"{OPENFOOTBALL_BASE}/{info['path']}"
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-    except Exception as e:
-        logger.warning("Fetch failed for %s: %s", league_key, e)
-        return None
-
-
-def parse_matches(data):
-    """Return list of matches with date, teams, score, status."""
-    if not data or "matches" not in data:
-        return []
-    out = []
-    for m in data["matches"]:
-        date = m.get("date", "")
-        team1 = m.get("team1", "?")
-        team2 = m.get("team2", "?")
-        score = m.get("score", {})
-        ft = score.get("ft") if isinstance(score, dict) else None
-        status = "finished" if ft else "scheduled"
-        out.append({
-            "date": date,
-            "team1": team1,
-            "team2": team2,
-            "ft": ft,
-            "status": status,
-            "key": f"{date}_{team1}_{team2}",
-        })
-    return out
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+def agregar_suscriptor(user):
     db_exec(
-        "INSERT OR IGNORE INTO subscribers (user_id, username, league, subscribed_at) VALUES (?,?,?,?)",
-        (user.id, user.username or "", "premier_league", datetime.utcnow().isoformat())
+        "INSERT OR IGNORE INTO suscriptores (user_id, username, nombre, liga, registrado_en) VALUES (?,?,?,?,?)",
+        (user.id, user.username or "", user.first_name or "", "la_liga", datetime.utcnow().isoformat())
     )
 
-    keyboard = [
-        [InlineKeyboardButton("📅 Today's Fixtures", callback_data="today")],
-        [InlineKeyboardButton("🏆 Standings", callback_data="standings")],
-        [InlineKeyboardButton("⚽ Choose League", callback_data="choose_league")],
-        [InlineKeyboardButton("🔔 My Subscription", callback_data="my_sub")],
-    ]
+# ---------- Menú principal ----------
+def menu_principal():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Partidos de Hoy", callback_data="hoy")],
+        [InlineKeyboardButton("🔜 Próximos Partidos", callback_data="proximos")],
+        [InlineKeyboardButton("✅ Resultados Recientes", callback_data="resultados")],
+        [InlineKeyboardButton("⚽ Elegir Liga", callback_data="elegir_liga")],
+        [InlineKeyboardButton("🔔 Mi Suscripción", callback_data="mi_suscripcion")],
+        [InlineKeyboardButton("ℹ️ Acerca de", callback_data="acerca")],
+    ])
+
+# ---------- /start ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    agregar_suscriptor(user)
 
     await update.message.reply_text(
-        f"👋 Welcome to <b>Football Updates</b>, {user.first_name}!\n\n"
-        "Get live match results, fixtures, and standings for major European leagues.\n\n"
-        "No predictions. Just real football data.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        f"👋 ¡Bienvenido a <b>Accedo Gratis Fútbol</b>, {user.first_name}!\n\n"
+        "Aquí recibirás información actualizada sobre fútbol: partidos, "
+        "resultados y las principales ligas europeas.\n\n"
+        "Sin pronósticos. Sin apuestas. Solo información real de fútbol.\n\n"
+        "Usa el menú para comenzar.",
+        reply_markup=menu_principal(),
         parse_mode="HTML"
     )
 
-
-async def today_fixtures(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Partidos de hoy ----------
+async def hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user_id = update.effective_user.id
 
-    rows = db_exec("SELECT league FROM subscribers WHERE user_id=?", (user_id,))
-    league = rows[0][0] if rows else "premier_league"
+    fecha_hoy = datetime.utcnow().strftime("%Y-%m-%d")
+    partidos_hoy = [p for p in PARTIDOS if p["fecha"] == fecha_hoy]
 
-    data = fetch_league(league)
-    matches = parse_matches(data)
-
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    today_matches = [m for m in matches if m["date"] == today]
-
-    if not today_matches:
-        # Show upcoming 5 if none today
-        upcoming = sorted([m for m in matches if m["date"] >= today], key=lambda x: x["date"])[:5]
-        text = f"📅 <b>No matches today in {LEAGUES[league]['name']}.</b>\n\nUpcoming:\n"
-        for m in upcoming:
-            text += f"• {m['date']} — {m['team1']} vs {m['team2']}\n"
+    if not partidos_hoy:
+        texto = (
+            f"📅 <b>No hay partidos programados para hoy.</b>\n\n"
+            f"Consulta los próximos partidos en el menú."
+        )
     else:
-        text = f"📅 <b>Today's Matches — {LEAGUES[league]['name']}</b>\n\n"
-        for m in today_matches:
-            if m["ft"]:
-                text += f"✅ {m['team1']} <b>{m['ft'][0]}-{m['ft'][1]}</b> {m['team2']}\n"
+        texto = "📅 <b>Partidos de Hoy</b>\n\n"
+        for p in partidos_hoy:
+            liga = LIGAS[p["liga"]]["nombre"]
+            texto += f"🏆 {liga}\n"
+            if p["marcador"]:
+                texto += f"✅ {p['local']} <b>{p['marcador'][0]}-{p['marcador'][1]}</b> {p['visitante']}\n\n"
             else:
-                text += f"⏳ {m['team1']} vs {m['team2']}\n"
+                texto += f"⏳ {p['local']} vs {p['visitante']}\n\n"
 
     await q.edit_message_text(
-        text, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
+        texto, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
     )
 
-
-async def standings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Próximos partidos ----------
+async def proximos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    # Standings require computed data; for simplicity, show a note + link to bot content
+
+    fecha_hoy = datetime.utcnow().strftime("%Y-%m-%d")
+    futuros = sorted([p for p in PARTIDOS if p["fecha"] > fecha_hoy], key=lambda x: x["fecha"])[:8]
+
+    if not futuros:
+        texto = "🔜 No hay próximos partidos registrados por ahora."
+    else:
+        texto = "🔜 <b>Próximos Partidos</b>\n\n"
+        for p in futuros:
+            liga = LIGAS[p["liga"]]["nombre"]
+            texto += f"📆 {p['fecha']} — {liga}\n"
+            texto += f"⚽ {p['local']} vs {p['visitante']}\n\n"
+
     await q.edit_message_text(
-        "🏆 <b>Standings</b>\n\n"
-        "Standings are calculated from match results in the free openfootball dataset. "
-        "Full standings display will be added in the next update.\n\n"
-        "For now, use 'Today's Fixtures' to see live results.",
+        texto, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
+    )
+
+# ---------- Resultados recientes ----------
+async def resultados(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    terminados = [p for p in PARTIDOS if p["marcador"]]
+
+    if not terminados:
+        texto = "✅ No hay resultados recientes disponibles."
+    else:
+        texto = "✅ <b>Resultados Recientes</b>\n\n"
+        for p in terminados[-8:]:
+            liga = LIGAS[p["liga"]]["nombre"]
+            texto += f"🏆 {liga}\n"
+            texto += f"✅ {p['local']} <b>{p['marcador'][0]}-{p['marcador'][1]}</b> {p['visitante']}\n"
+            texto += f"📆 {p['fecha']}\n\n"
+
+    await q.edit_message_text(
+        texto, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
+    )
+
+# ---------- Elegir liga ----------
+async def elegir_liga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    botones = []
+    for key, info in LIGAS.items():
+        botones.append([InlineKeyboardButton(f"⚽ {info['nombre']}", callback_data=f"liga_{key}")])
+    botones.append([InlineKeyboardButton("🔙 Volver", callback_data="volver")])
+
+    await q.edit_message_text(
+        "⚽ <b>Elige tu liga favorita:</b>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
+        reply_markup=InlineKeyboardMarkup(botones)
     )
 
-
-async def choose_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Establecer liga ----------
+async def set_liga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    keyboard = [
-        [InlineKeyboardButton("🇬🇧 Premier League", callback_data="league_premier_league")],
-        [InlineKeyboardButton("🇪🇸 La Liga", callback_data="league_la_liga")],
-        [InlineKeyboardButton("🇩🇪 Bundesliga", callback_data="league_bundesliga")],
-        [InlineKeyboardButton("🇮🇹 Serie A", callback_data="league_serie_a")],
-        [InlineKeyboardButton("🇫🇷 Ligue 1", callback_data="league_ligue_1")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back")],
-    ]
-    await q.edit_message_text("⚽ <b>Choose your league:</b>", parse_mode="HTML",
-                              reply_markup=InlineKeyboardMarkup(keyboard))
 
-
-async def set_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    league = q.data.replace("league_", "")
-    if league not in LEAGUES:
-        await q.edit_message_text("Unknown league.")
+    liga_key = q.data.replace("liga_", "")
+    if liga_key not in LIGAS:
+        await q.edit_message_text("Liga no encontrada.")
         return
-    db_exec("UPDATE subscribers SET league=? WHERE user_id=?", (league, update.effective_user.id))
+
+    db_exec("UPDATE suscriptores SET liga=? WHERE user_id=?", (liga_key, update.effective_user.id))
+
     await q.edit_message_text(
-        f"✅ Your league is now <b>{LEAGUES[league]['name']}</b>.",
+        f"✅ Tu liga ahora es <b>{LIGAS[liga_key]['nombre']}</b>.\n\n"
+        f"Recibirás actualizaciones automáticas de esta liga.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
     )
 
-
-async def my_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Mi suscripción ----------
+async def mi_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    rows = db_exec("SELECT league FROM subscribers WHERE user_id=?", (update.effective_user.id,))
-    league = rows[0][0] if rows else "premier_league"
+
+    user_id = update.effective_user.id
+    filas = db_exec("SELECT liga FROM suscriptores WHERE user_id=?", (user_id,))
+    liga_key = filas[0][0] if filas else "la_liga"
+
+    total = db_exec("SELECT COUNT(*) FROM suscriptores")[0][0]
+
     await q.edit_message_text(
-        f"🔔 <b>Your Subscription</b>\n\nLeague: <b>{LEAGUES[league]['name']}</b>\n\n"
-        "You will receive automatic result notifications for finished matches.",
+        f"🔔 <b>Mi Suscripción</b>\n\n"
+        f"Liga actual: <b>{LIGAS[liga_key]['nombre']}</b>\n\n"
+        f"Recibirás notificaciones automáticas cuando haya nuevos resultados.\n\n"
+        f"👥 Total de suscriptores: {total}",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
     )
 
-
-async def back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Acerca de ----------
+async def acerca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    keyboard = [
-        [InlineKeyboardButton("📅 Today's Fixtures", callback_data="today")],
-        [InlineKeyboardButton("🏆 Standings", callback_data="standings")],
-        [InlineKeyboardButton("⚽ Choose League", callback_data="choose_league")],
-        [InlineKeyboardButton("🔔 My Subscription", callback_data="my_sub")],
-    ]
-    await q.edit_message_text("Main menu:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+    await q.edit_message_text(
+        "ℹ️ <b>Acerca de Accedo Gratis Fútbol</b>\n\n"
+        "Este bot entrega información actualizada sobre fútbol: partidos, "
+        "resultados y las principales ligas europeas.\n\n"
+        "Elige tu liga favorita y recibe novedades directamente en tu Telegram.\n\n"
+        "Sin pronósticos. Sin apuestas. Solo información real de fútbol.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="volver")]])
+    )
 
-async def auto_notify(context: ContextTypes.DEFAULT_TYPE):
-    """Check for newly finished matches and notify subscribers."""
-    logger.info("Auto-notify check running...")
-    for league_key in LEAGUES:
-        data = fetch_league(league_key)
-        matches = parse_matches(data)
-        for m in matches:
-            if m["status"] != "finished":
-                continue
-            if db_exec("SELECT 1 FROM sent_matches WHERE match_key=?", (m["key"],)):
-                continue
-            # Send to subscribers of this league
-            subs = db_exec("SELECT user_id FROM subscribers WHERE league=?", (league_key,))
-            text = (
-                f"⚽ <b>Full Time</b> — {LEAGUES[league_key]['name']}\n\n"
-                f"{m['team1']} <b>{m['ft'][0]}-{m['ft'][1]}</b> {m['team2']}\n"
-                f"📅 {m['date']}"
-            )
-            for (uid,) in subs:
-                try:
-                    await context.bot.send_message(uid, text, parse_mode="HTML")
-                except Exception:
-                    pass
-            db_exec("INSERT INTO sent_matches (match_key, sent_at) VALUES (?,?)",
-                    (m["key"], datetime.utcnow().isoformat()))
+# ---------- Volver ----------
+async def volver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "Menú principal — elige una opción:",
+        reply_markup=menu_principal()
+    )
 
+# ---------- Notificación automática ----------
+async def notificar_resultados(context: ContextTypes.DEFAULT_TYPE):
+    """Envía resultados recientes a los suscriptores automáticamente."""
+    logger.info("Verificando resultados para notificar...")
+
+    terminados = [p for p in PARTIDOS if p["marcador"]]
+    if not terminados:
+        return
+
+    frase = random.choice(FRASES_DIARIAS)
+    ultimos = terminados[-3:]
+
+    texto = f"⚽ <b>Actualización de Fútbol</b>\n\n{frase}\n\n"
+    for p in ultimos:
+        liga = LIGAS[p["liga"]]["nombre"]
+        texto += f"🏆 {liga}\n"
+        texto += f"✅ {p['local']} <b>{p['marcador'][0]}-{p['marcador'][1]}</b> {p['visitante']}\n\n"
+
+    suscriptores = db_exec("SELECT user_id FROM suscriptores")
+    enviados = 0
+    for (uid,) in suscriptores:
+        try:
+            await context.bot.send_message(uid, texto, parse_mode="HTML")
+            enviados += 1
+        except Exception:
+            pass
+
+    logger.info("Notificación enviada a %d suscriptores.", enviados)
 
 async def post_init(app: Application):
-    app.job_queue.run_repeating(auto_notify, interval=1800, first=10)  # every 30 min
-    logger.info("Auto-notify scheduled.")
+    # Enviar actualizaciones cada 6 horas
+    app.job_queue.run_repeating(notificar_resultados, interval=21600, first=60)
+    logger.info("Notificaciones automáticas programadas cada 6 horas.")
 
-
+# ---------- Main ----------
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN required.")
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(today_fixtures, pattern="^today$"))
-    app.add_handler(CallbackQueryHandler(standings, pattern="^standings$"))
-    app.add_handler(CallbackQueryHandler(choose_league, pattern="^choose_league$"))
-    app.add_handler(CallbackQueryHandler(set_league, pattern="^league_"))
-    app.add_handler(CallbackQueryHandler(my_sub, pattern="^my_sub$"))
-    app.add_handler(CallbackQueryHandler(back, pattern="^back$"))
-    app.run_polling()
+        raise SystemExit("TELEGRAM_BOT_TOKEN es obligatorio.")
 
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    app.add_handler(CallbackQueryHandler(hoy, pattern="^hoy$"))
+    app.add_handler(CallbackQueryHandler(proximos, pattern="^proximos$"))
+    app.add_handler(CallbackQueryHandler(resultados, pattern="^resultados$"))
+    app.add_handler(CallbackQueryHandler(elegir_liga, pattern="^elegir_liga$"))
+    app.add_handler(CallbackQueryHandler(set_liga, pattern="^liga_"))
+    app.add_handler(CallbackQueryHandler(mi_suscripcion, pattern="^mi_suscripcion$"))
+    app.add_handler(CallbackQueryHandler(acerca, pattern="^acerca$"))
+    app.add_handler(CallbackQueryHandler(volver, pattern="^volver$"))
+
+    logger.info("Bot de fútbol en español iniciando...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
